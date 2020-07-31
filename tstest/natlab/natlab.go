@@ -93,9 +93,10 @@ func mustPrefix(s string) netaddr.IPPrefix {
 // NewInternet returns a network that simulates the internet.
 func NewInternet() *Network {
 	return &Network{
-		Name:    "internet",
-		Prefix4: mustPrefix("203.0.113.0/24"), // documentation netblock that looks Internet-y
-		Prefix6: mustPrefix("fc00:52::/64"),
+		Name: "internet",
+		// easily recognizable internett-y addresses
+		Prefix4: mustPrefix("1.0.0.0/24"),
+		Prefix6: mustPrefix("1111::/64"),
 	}
 }
 
@@ -184,6 +185,17 @@ func (n *Network) write(p *Packet) (num int, err error) {
 	defer n.mu.Unlock()
 	iface, ok := n.machine[p.Dst.IP]
 	if !ok {
+		// If the destination is within the network's authoritative
+		// range, no route to host.
+		if p.Dst.IP.Is4() && n.Prefix4.Contains(p.Dst.IP) {
+			p.Trace("no route to %v", p.Dst.IP)
+			return len(p.Payload), nil
+		}
+		if p.Dst.IP.Is6() && n.Prefix6.Contains(p.Dst.IP) {
+			p.Trace("no route to %v", p.Dst.IP)
+			return len(p.Payload), nil
+		}
+
 		if n.defaultGW == nil {
 			p.Trace("no route to %v", p.Dst.IP)
 			return len(p.Payload), nil

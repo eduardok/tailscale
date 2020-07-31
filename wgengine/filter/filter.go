@@ -6,6 +6,7 @@
 package filter
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -136,8 +137,12 @@ func maybeHexdump(flag RunFlags, b []byte) string {
 var acceptBucket = rate.NewLimiter(rate.Every(10*time.Second), 3)
 var dropBucket = rate.NewLimiter(rate.Every(5*time.Second), 10)
 
-func (f *Filter) logRateLimit(runflags RunFlags, q *packet.ParsedPacket, r Response, why string) {
+func (f *Filter) logRateLimit(runflags RunFlags, q *packet.ParsedPacket, dir direction, r Response, why string) {
 	var verdict string
+
+	if r == Drop && omitDropLogging(q, dir) {
+		return
+	}
 
 	if r == Drop && (runflags&LogDrops) != 0 && dropBucket.Allow() {
 		verdict = "Drop"
@@ -157,26 +162,28 @@ func (f *Filter) logRateLimit(runflags RunFlags, q *packet.ParsedPacket, r Respo
 
 // RunIn determines whether this node is allowed to receive q from a Tailscale peer.
 func (f *Filter) RunIn(q *packet.ParsedPacket, rf RunFlags) Response {
-	r := f.pre(q, rf)
+	dir := in
+	r := f.pre(q, rf, dir)
 	if r == Accept || r == Drop {
 		// already logged
 		return r
 	}
 
 	r, why := f.runIn(q)
-	f.logRateLimit(rf, q, r, why)
+	f.logRateLimit(rf, q, dir, r, why)
 	return r
 }
 
 // RunOut determines whether this node is allowed to send q to a Tailscale peer.
 func (f *Filter) RunOut(q *packet.ParsedPacket, rf RunFlags) Response {
-	r := f.pre(q, rf)
+	dir := out
+	r := f.pre(q, rf, dir)
 	if r == Drop || r == Accept {
 		// already logged
 		return r
 	}
 	r, why := f.runOut(q)
-	f.logRateLimit(rf, q, r, why)
+	f.logRateLimit(rf, q, dir, r, why)
 	return r
 }
 
@@ -186,6 +193,11 @@ func (f *Filter) runIn(q *packet.ParsedPacket) (r Response, why string) {
 	// prevent that.
 	if !ipInList(q.DstIP, f.localNets) {
 		return Drop, "destination not allowed"
+	}
+
+	if q.IPVersion == 6 {
+		// TODO: support IPv6.
+		return Drop, "no rules matched"
 	}
 
 	switch q.IPProto {
@@ -247,30 +259,103 @@ func (f *Filter) runOut(q *packet.ParsedPacket) (r Response, why string) {
 	return Accept, "ok out"
 }
 
-func (f *Filter) pre(q *packet.ParsedPacket, rf RunFlags) Response {
+// direction is whether a packet was flowing in to this machine, or flowing out.
+type direction int
+
+const (
+	in direction = iota
+	out
+)
+
+func (d direction) String() string {
+	switch d {
+	case in:
+		return "in"
+	case out:
+		return "out"
+	default:
+		return fmt.Sprintf("[??dir=%d]", int(d))
+	}
+}
+
+func (f *Filter) pre(q *packet.ParsedPacket, rf RunFlags, dir direction) Response {
 	if len(q.Buffer()) == 0 {
 		// wireguard keepalive packet, always permit.
 		return Accept
 	}
 	if len(q.Buffer()) < 20 {
-		f.logRateLimit(rf, q, Drop, "too short")
+		f.logRateLimit(rf, q, dir, Drop, "too short")
 		return Drop
 	}
 
+	if q.IPVersion == 6 {
+		f.logRateLimit(rf, q, dir, Drop, "ipv6")
+		return Drop
+	}
 	switch q.IPProto {
 	case packet.Unknown:
 		// Unknown packets are dangerous; always drop them.
-		f.logRateLimit(rf, q, Drop, "unknown")
-		return Drop
-	case packet.IPv6:
-		f.logRateLimit(rf, q, Drop, "ipv6")
+		f.logRateLimit(rf, q, dir, Drop, "unknown")
 		return Drop
 	case packet.Fragment:
 		// Fragments after the first always need to be passed through.
 		// Very small fragments are considered Junk by ParsedPacket.
-		f.logRateLimit(rf, q, Accept, "fragment")
+		f.logRateLimit(rf, q, dir, Accept, "fragment")
 		return Accept
 	}
 
 	return noVerdict
+}
+
+const (
+	// ipv6AllRoutersLinkLocal is ff02::2 (All link-local routers)
+	ipv6AllRoutersLinkLocal = "\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	// ipv6AllMLDv2CapableRouters is ff02::16 (All MLDv2-capable routers)
+	ipv6AllMLDv2CapableRouters = "\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x16"
+)
+
+// omitDropLogging reports whether packet p, which has already been
+// deemded a packet to Drop, should bypass the [rate-limited] logging.
+// We don't want to log scary & spammy reject warnings for packets that
+// are totally normal, like IPv6 route announcements.
+func omitDropLogging(p *packet.ParsedPacket, dir direction) bool {
+	b := p.Buffer()
+	switch dir {
+	case out:
+		switch p.IPVersion {
+		case 4:
+			// ParsedPacket.Decode zeros out ParsedPacket.IPProtocol for protocols
+			// it doesn't know about, so parse it out ourselves if needed.
+			ipProto := p.IPProto
+			if ipProto == 0 && len(b) > 8 {
+				ipProto = packet.IPProto(b[9])
+			}
+			// Omit logging about outgoing IGMP.
+			if ipProto == packet.IGMP {
+				return true
+			}
+		case 6:
+			if len(b) < 40 {
+				return false
+			}
+			src, dst := b[8:8+16], b[24:24+16]
+			// Omit logging for outgoing IPv6 ICMP-v6 queries to ff02::2,
+			// as sent by the OS, looking for routers.
+			if p.IPProto == packet.ICMPv6 {
+				if isLinkLocalV6(src) && string(dst) == ipv6AllRoutersLinkLocal {
+					return true
+				}
+			}
+			if string(dst) == ipv6AllMLDv2CapableRouters {
+				return true
+			}
+			panic(fmt.Sprintf("Got proto=%2x; src=%x dst=%x", int(p.IPProto), src, dst))
+		}
+	}
+	return false
+}
+
+// isLinkLocalV6 reports whether src is in fe80::/10.
+func isLinkLocalV6(src []byte) bool {
+	return len(src) == 16 && src[0] == 0xfe && src[1]>>6 == 0x80>>6
 }

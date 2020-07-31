@@ -4,6 +4,8 @@
 
 package controlclient
 
+//go:generate go run tailscale.com/cmd/cloner -type=Persist -output=direct_clone.go
+
 import (
 	"bytes"
 	"context"
@@ -19,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -165,12 +168,20 @@ func NewDirect(opts Options) (*Direct, error) {
 	return c, nil
 }
 
+var osVersion func() string // non-nil on some platforms
+
 func NewHostinfo() *tailcfg.Hostinfo {
 	hostname, _ := os.Hostname()
+	var osv string
+	if osVersion != nil {
+		osv = osVersion()
+	}
 	return &tailcfg.Hostinfo{
 		IPNVersion: version.LONG,
 		Hostname:   hostname,
 		OS:         version.OS(),
+		OSVersion:  osv,
+		GoArch:     runtime.GOARCH,
 	}
 }
 
@@ -619,6 +630,7 @@ func (c *Direct) PollNetMap(ctx context.Context, maxPolls int, cb func(*NetworkM
 			NodeKey:      tailcfg.NodeKey(persist.PrivateNodeKey.Public()),
 			PrivateKey:   persist.PrivateNodeKey,
 			Expiry:       resp.Node.KeyExpiry,
+			Name:         resp.Node.Name,
 			Addresses:    resp.Node.Addresses,
 			Peers:        resp.Peers,
 			LocalPort:    localPort,

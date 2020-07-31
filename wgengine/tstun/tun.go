@@ -45,6 +45,11 @@ var (
 	errOffsetTooSmall = errors.New("offset smaller than PacketStartOffset")
 )
 
+// parsedPacketPool holds a pool of ParsedPacket structs for use in filtering.
+// This is needed because escape analysis cannot see that parsed packets
+// do not escape through {Pre,Post}Filter{In,Out}.
+var parsedPacketPool = sync.Pool{New: func() interface{} { return new(packet.ParsedPacket) }}
+
 // FilterFunc is a packet-filtering function with access to the TUN device.
 // It must not hold onto the packet struct, as its backing storage will be reused.
 type FilterFunc func(*packet.ParsedPacket, *TUN) filter.Response
@@ -61,15 +66,13 @@ type TUN struct {
 	_                  [4]byte // force 64-bit alignment of following field on 32-bit
 	lastActivityAtomic int64   // unix seconds of last send or receive
 
+	destIPActivity atomic.Value // of map[packet.IP]func()
+
 	// buffer stores the oldest unconsumed packet from tdev.
 	// It is made a static buffer in order to avoid allocations.
 	buffer [maxBufferSize]byte
 	// bufferConsumed synchronizes access to buffer (shared by Read and poll).
 	bufferConsumed chan struct{}
-	// parsedPacketPool holds a pool of ParsedPacket structs for use in filtering.
-	// This is needed because escape analysis cannot see that parsed packets
-	// do not escape through {Pre,Post}Filter{In,Out}.
-	parsedPacketPool sync.Pool // of *packet.ParsedPacket
 
 	// closed signals poll (by closing) when the device is closed.
 	closed chan struct{}
@@ -121,15 +124,19 @@ func WrapTUN(logf logger.Logf, tdev tun.Device) *TUN {
 		filterFlags: filter.LogAccepts | filter.LogDrops,
 	}
 
-	tun.parsedPacketPool.New = func() interface{} {
-		return new(packet.ParsedPacket)
-	}
-
 	go tun.poll()
 	// The buffer starts out consumed.
 	tun.bufferConsumed <- struct{}{}
 
 	return tun
+}
+
+// SetDestIPActivityFuncs sets a map of funcs to run per packet
+// destination (the map keys).
+//
+// The map ownership passes to the TUN. It must be non-nil.
+func (t *TUN) SetDestIPActivityFuncs(m map[packet.IP]func()) {
+	t.destIPActivity.Store(m)
 }
 
 func (t *TUN) Close() error {
@@ -207,10 +214,7 @@ func (t *TUN) poll() {
 	}
 }
 
-func (t *TUN) filterOut(buf []byte) filter.Response {
-	p := t.parsedPacketPool.Get().(*packet.ParsedPacket)
-	defer t.parsedPacketPool.Put(p)
-	p.Decode(buf)
+func (t *TUN) filterOut(p *packet.ParsedPacket) filter.Response {
 
 	if t.PreFilterOut != nil {
 		if t.PreFilterOut(p, t) == filter.Drop {
@@ -274,8 +278,18 @@ func (t *TUN) Read(buf []byte, offset int) (int, error) {
 		}
 	}
 
+	p := parsedPacketPool.Get().(*packet.ParsedPacket)
+	defer parsedPacketPool.Put(p)
+	p.Decode(buf[offset : offset+n])
+
+	if m, ok := t.destIPActivity.Load().(map[packet.IP]func()); ok {
+		if fn := m[p.DstIP]; fn != nil {
+			fn()
+		}
+	}
+
 	if !t.disableFilter {
-		response := t.filterOut(buf[offset : offset+n])
+		response := t.filterOut(p)
 		if response != filter.Accept {
 			// Wireguard considers read errors fatal; pretend nothing was read
 			return 0, nil
@@ -287,8 +301,8 @@ func (t *TUN) Read(buf []byte, offset int) (int, error) {
 }
 
 func (t *TUN) filterIn(buf []byte) filter.Response {
-	p := t.parsedPacketPool.Get().(*packet.ParsedPacket)
-	defer t.parsedPacketPool.Put(p)
+	p := parsedPacketPool.Get().(*packet.ParsedPacket)
+	defer parsedPacketPool.Put(p)
 	p.Decode(buf)
 
 	if t.PreFilterIn != nil {
